@@ -15,8 +15,8 @@ class MicroPulseIndicators:
         self.cvd: float = 0.0
 
         self.window_sec: float = 10.0
-        self.price_buffer = deque()  # (time, mid_price)
-        self.trade_buffer = deque()  # (time, side, quantity)
+        self.price_buffer = deque()   # (timestamp, mid_price)
+        self.trade_buffer = deque()   # (timestamp, side, quantity)
 
         self.wall_factor: float = 8.0
         self.wall_drop_ratio: float = 0.3
@@ -25,21 +25,20 @@ class MicroPulseIndicators:
         self.last_wall_event = None
 
         self.trade_quantity: float = 0.01
-        self.position = {} # {ts: {price: p, quantity: q}}
+        self.position = {}  # {ts: {price: p, quantity: q}}
 
         self.transaction = []
 
     def _update_position(self, ts, price, side: float):
         self.position[ts] = {
-            'price': price,
-            'quantity': self.trade_quantity * side,
-            'entry_cvd': self.cvd,
-            'entry_obi': self.obi,
-            'current_tp': 0.0008,
+            "price": price,
+            "quantity": self.trade_quantity * side,
+            "entry_cvd": self.cvd,
+            "entry_obi": self.obi,
+            "current_tp": 0.0008,
         }
 
     def _trim_buffers(self, ts):
-
         cutoff = ts - self.window_sec
 
         while self.price_buffer and self.price_buffer[0][0] < cutoff:
@@ -82,6 +81,7 @@ class MicroPulseIndicators:
         bid_map = {float(p): float(s) for p, s in bids}
         ask_map = {float(p): float(s) for p, s in asks}
 
+        # Detect bid wall disappearance
         for price, info in list(self.bid_walls.items()):
             wall_size = float(info["size"])
             bid_size = bid_map.get(price, 0.0)
@@ -96,6 +96,7 @@ class MicroPulseIndicators:
                 }
                 del self.bid_walls[price]
 
+        # Detect ask wall disappearance
         for price, info in list(self.ask_walls.items()):
             wall_size = float(info["size"])
             ask_size = ask_map.get(price, 0.0)
@@ -111,30 +112,28 @@ class MicroPulseIndicators:
                 del self.ask_walls[price]
 
     def _update_walls(self, ts, bids, asks):
-        avg_bid_size = sum(float(size) for price, size in bids) / len(bids)
-        avg_ask_size = sum(float(size) for price, size in asks) / len(asks)
+        avg_bid_size = sum(float(size) for _, size in bids) / len(bids)
+        avg_ask_size = sum(float(size) for _, size in asks) / len(asks)
 
+        # Detect new bid walls
         for price, size in bids:
             price = float(price)
             size = float(size)
             if size > avg_bid_size * self.wall_factor:
                 if price not in self.bid_walls:
-                    self.bid_walls[price] = {
-                        "size": size,
-                        "created_ts": ts
-                    }
+                    self.bid_walls[price] = {"size": size, "created_ts": ts}
+
+        # Detect new ask walls
         for price, size in asks:
             price = float(price)
             size = float(size)
             if size > avg_ask_size * self.wall_factor:
                 if price not in self.ask_walls:
-                    self.ask_walls[price] = {
-                        "size": size,
-                        "created_ts": ts
-                    }
+                    self.ask_walls[price] = {"size": size, "created_ts": ts}
+
         self._check_wall_removal(ts, bids, asks)
 
-    def get_mid_price(self, bids, asks) -> None:
+    def get_mid_price(self, bids, asks):
         ts = time.time()
         best_bid = float(bids[0][0])
         best_ask = float(asks[0][0])
@@ -143,28 +142,26 @@ class MicroPulseIndicators:
 
         self.price_buffer.append((ts, self.mid_price))
         self._trim_buffers(ts)
-
         self._update_walls(ts, bids, asks)
 
-    def get_obi(self, bids, asks) -> None:
-        total_bid = sum(float(bid[1]) for bid in bids)
-        total_ask = sum(float(ask[1]) for ask in asks)
+    def get_obi(self, bids, asks):
+        total_bid = sum(float(b[1]) for b in bids)
+        total_ask = sum(float(a[1]) for a in asks)
 
         if total_bid + total_ask == 0:
             self.obi = 0.0
         else:
             self.obi = (total_bid - total_ask) / (total_bid + total_ask)
 
-    def get_volume_delta(self, data) -> None:
+    def get_volume_delta(self, data):
         ts = time.time()
         qty = float(data.get("q"))
         buyer_is_maker = data.get("m")
 
-        if buyer_is_maker == True:  # buyer is maker(=seller is taker)
+        if buyer_is_maker:
             self.cum_sell_vol += qty
             side = "sell"
-
-        else:  # buyer is taker(=seller is maker)
+        else:
             self.cum_buy_vol += qty
             side = "buy"
 
@@ -256,7 +253,7 @@ def check_entry(stats):
         return
 
     if side == "ask":
-        if spike_up > MIN_SPIKE and obi < - MIN_OBI:
+        if spike_up > MIN_SPIKE and obi < -MIN_OBI:
             print(
                 f"[SIGNAL SHORT] mid={mid:.2f}, spike_up={spike_up:.4%}, "
                 f"obi={obi:.4f}, wall={wall}, tps={tps:.2f}, ats={avg_trade_size:.4f}"
@@ -287,12 +284,12 @@ def check_exit(stats):
     FAST_WINDOW = 0.5
     FAST_FAIL = 0.0003
 
-    BOOST_WINDOW = 1.0  # TP boost 체크 윈도우
-    BOOST_RET = 0.0005  # 이만큼 빨리 이득 나면
-    BOOST_TP = 0.0015  # TP를 이 값으로 늘림 (0.15%)
+    BOOST_WINDOW = 1.0
+    BOOST_RET = 0.0005
+    BOOST_TP = 0.0015
 
-    REV_CVD = 0.05 # reverse CVD
-    REV_OBI = 0.1 # reverse OBI
+    REV_CVD = 0.05
+    REV_OBI = 0.1
 
     for ts, trade in list(pos.items()):
         price = trade["price"]
@@ -308,7 +305,7 @@ def check_exit(stats):
             continue
 
         direction = quantity / abs(quantity)
-        position_return = direction * (mid - price)/price
+        position_return = direction * (mid - price) / price
 
         delta_cvd = None
         delta_obi = None
@@ -318,29 +315,25 @@ def check_exit(stats):
 
         reason = None
 
-        # 1) Fast invalidation: 촨에 바로 역행하면 셋업 폐기
         if hold_time <= FAST_WINDOW and position_return <= -FAST_FAIL:
             reason = "fast_invalidation"
 
-        # 2) Dynamic TP boost: 초반에 잘 가면 더 크게 먹기
         if reason is None and hold_time <= BOOST_WINDOW:
             if position_return >= BOOST_RET and current_tp < BOOST_TP:
                 trade["current_tp"] = BOOST_TP
                 current_tp = BOOST_TP
 
-        # 3) TP / SL
         if reason is None:
             if position_return >= current_tp:
                 reason = "tp"
             elif position_return <= -SL:
                 reason = "sl"
 
-        # 4) Flow reversal: CVD/OBI
         if reason is None and delta_cvd is not None and delta_obi is not None:
-            if direction > 0: # LONG
+            if direction > 0:
                 if delta_cvd < -REV_CVD and delta_obi < -REV_OBI:
                     reason = "flow_reversal"
-            else:  # SHORT
+            else:
                 if delta_cvd > REV_CVD and delta_obi > REV_OBI:
                     reason = "flow_reversal"
 
@@ -350,8 +343,8 @@ def check_exit(stats):
 
 def on_message(ws, message):
     msg = json.loads(message)
-    stream = msg.get("stream", "")
     data = msg.get("data", {})
+
     if data.get("e") == "depthUpdate":
         bids = data["b"]
         asks = data["a"]
@@ -382,14 +375,14 @@ def on_message(ws, message):
         check_exit(stats)
 
 def on_error(ws, error):
-    print("Error: ", error)
+    print("Error:", error)
 
 def on_close(ws, close_status_code, close_msg):
     ind._log_transactions()
-    print("WebSocket closed ", close_status_code, close_msg)
+    print("WebSocket closed", close_status_code, close_msg)
 
 def on_open(ws):
-    print("WebSocket connected to Binance future BTCUSDT stream")
+    print("WebSocket connected to Binance futures BTCUSDT stream")
 
 if __name__ == "__main__":
     ws = WebSocketApp(
