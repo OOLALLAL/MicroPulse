@@ -33,6 +33,9 @@ class MicroPulseIndicators:
         self.position[ts] = {
             'price': price,
             'quantity': self.trade_quantity * side,
+            'entry_cvd': self.cvd,
+            'entry_obi': self.obi,
+            'current_tp': 0.0008,
         }
 
     def _trim_buffers(self, ts):
@@ -73,6 +76,7 @@ class MicroPulseIndicators:
             header=not os.path.exists("transaction.csv"),
             index=False,
         )
+        self.transaction = []
 
     def _check_wall_removal(self, ts, bids, asks):
         bid_map = {float(p): float(s) for p, s in bids}
@@ -91,6 +95,7 @@ class MicroPulseIndicators:
                     "removed_ts": ts,
                 }
                 del self.bid_walls[price]
+
         for price, info in list(self.ask_walls.items()):
             wall_size = float(info["size"])
             ask_size = ask_map.get(price, 0.0)
@@ -106,7 +111,6 @@ class MicroPulseIndicators:
                 del self.ask_walls[price]
 
     def _update_walls(self, ts, bids, asks):
-
         avg_bid_size = sum(float(size) for price, size in bids) / len(bids)
         avg_ask_size = sum(float(size) for price, size in asks) / len(asks)
 
@@ -170,7 +174,6 @@ class MicroPulseIndicators:
         self.cvd = self.cum_buy_vol - self.cum_sell_vol
 
     def get_window_stats(self):
-
         if not self.price_buffer:
             return None
 
@@ -221,31 +224,53 @@ def check_entry(stats):
     wall = stats["last_wall_event"]
     if wall is None:
         return
+
     side = wall["side"]
     mid = stats["mid"]
     spike_up = stats["spike_up"]
     spike_down = stats["spike_down"]
-    window_cvd = stats["window_cvd"]
     obi = stats["obi"]
+    tps = stats["trades_per_sec"]
+    avg_trade_size = stats["avg_trade_size"]
 
     MIN_SPIKE = 0.0005
-    MIN_CVD = 0.1
+    MIN_TPS = 2.0
+    MIN_AVG_SIZE = 0.05
+    MIN_OBI = 0.15
+    MAX_ENTRY_DELAY = 2.0
+    MAX_WALL_DIST = 0.0007
+
+    removed_ts = wall["removed_ts"]
+    if time.time() - removed_ts > MAX_ENTRY_DELAY:
+        ind.last_wall_event = None
+        return
+
+    wall_price = wall["price"]
+    wall_dist = abs(wall_price - mid) / mid
+    if wall_dist > MAX_WALL_DIST:
+        ind.last_wall_event = None
+        return
+
+    if tps < MIN_TPS or avg_trade_size < MIN_AVG_SIZE:
+        ind.last_wall_event = None
+        return
 
     if side == "ask":
-        if spike_up > MIN_SPIKE and window_cvd < -MIN_CVD:
+        if spike_up > MIN_SPIKE and obi < - MIN_OBI:
             print(
                 f"[SIGNAL SHORT] mid={mid:.2f}, spike_up={spike_up:.4%}, "
-                f"win_cvd={window_cvd:.4f}, obi={obi:.3f}, wall={wall}"
+                f"obi={obi:.4f}, wall={wall}, tps={tps:.2f}, ats={avg_trade_size:.4f}"
             )
             ind._update_position(time.time(), mid, -1)
 
     elif side == "bid":
-        if spike_down > MIN_SPIKE and window_cvd > MIN_CVD:
+        if spike_down > MIN_SPIKE and obi > MIN_OBI:
             print(
                 f"[SIGNAL LONG] mid={mid:.2f}, spike_dn={spike_down:.4%}, "
-                f"win_cvd={window_cvd:.4f}, obi={obi:.3f}, wall={wall}"
+                f"obi={obi:.3f}, wall={wall}, tps={tps:.2f}, ats={avg_trade_size:.4f}"
             )
             ind._update_position(time.time(), mid, 1)
+
     ind.last_wall_event = None
 
 def check_exit(stats):
@@ -253,15 +278,31 @@ def check_exit(stats):
     pos = ind.position
     if not pos:
         return
+
     current_ts = time.time()
-    TP = 0.0008
+    BASE_TP = 0.0008
     SL = 0.0005
+    MAX_HOLD = 15.0
+
+    FAST_WINDOW = 0.5
+    FAST_FAIL = 0.0003
+
+    BOOST_WINDOW = 1.0  # TP boost 체크 윈도우
+    BOOST_RET = 0.0005  # 이만큼 빨리 이득 나면
+    BOOST_TP = 0.0015  # TP를 이 값으로 늘림 (0.15%)
+
+    REV_CVD = 0.05 # reverse CVD
+    REV_OBI = 0.1 # reverse OBI
 
     for ts, trade in list(pos.items()):
         price = trade["price"]
         quantity = trade["quantity"]
+        entry_cvd = trade.get("entry_cvd")
+        entry_obi = trade.get("entry_obi")
+        current_tp = trade.get("current_tp", BASE_TP)
 
-        if current_ts - ts > 15:
+        hold_time = current_ts - ts
+        if hold_time > MAX_HOLD:
             ind._update_transaction(ts, price, current_ts, mid, quantity, "time_stop")
             pos.pop(ts)
             continue
@@ -269,15 +310,43 @@ def check_exit(stats):
         direction = quantity / abs(quantity)
         position_return = direction * (mid - price)/price
 
-        if position_return >= TP:
-            reason = "tp"
-        elif position_return < -SL:
-            reason = "sl"
+        delta_cvd = None
+        delta_obi = None
+        if entry_cvd is not None and entry_obi is not None:
+            delta_cvd = stats["cvd"] - entry_cvd
+            delta_obi = stats["obi"] - entry_obi
+
+        reason = None
+
+        # 1) Fast invalidation: 촨에 바로 역행하면 셋업 폐기
+        if hold_time <= FAST_WINDOW and position_return <= -FAST_FAIL:
+            reason = "fast_invalidation"
+
+        # 2) Dynamic TP boost: 초반에 잘 가면 더 크게 먹기
+        if reason is None and hold_time <= BOOST_WINDOW:
+            if position_return >= BOOST_RET and current_tp < BOOST_TP:
+                trade["current_tp"] = BOOST_TP
+                current_tp = BOOST_TP
+
+        # 3) TP / SL
+        if reason is None:
+            if position_return >= current_tp:
+                reason = "tp"
+            elif position_return <= -SL:
+                reason = "sl"
+
+        # 4) Flow reversal: CVD/OBI
+        if reason is None and delta_cvd is not None and delta_obi is not None:
+            if direction > 0: # LONG
+                if delta_cvd < -REV_CVD and delta_obi < -REV_OBI:
+                    reason = "flow_reversal"
+            else:  # SHORT
+                if delta_cvd > REV_CVD and delta_obi > REV_OBI:
+                    reason = "flow_reversal"
+
         if reason is not None:
             ind._update_transaction(ts, price, current_ts, mid, quantity, reason)
             pos.pop(ts)
-
-        # more strategy
 
 def on_message(ws, message):
     msg = json.loads(message)
@@ -312,20 +381,15 @@ def on_message(ws, message):
         check_entry(stats)
         check_exit(stats)
 
-
-
 def on_error(ws, error):
     print("Error: ", error)
-
 
 def on_close(ws, close_status_code, close_msg):
     ind._log_transactions()
     print("WebSocket closed ", close_status_code, close_msg)
 
-
 def on_open(ws):
     print("WebSocket connected to Binance future BTCUSDT stream")
-
 
 if __name__ == "__main__":
     ws = WebSocketApp(
