@@ -20,6 +20,7 @@ class MicroPulseIndicators:
 
         self.wall_factor: float = 8.0
         self.wall_drop_ratio: float = 0.3
+        self.min_wall_vol: float = 15.0
         self.bid_walls = {}
         self.ask_walls = {}
         self.last_wall_event = None
@@ -49,8 +50,6 @@ class MicroPulseIndicators:
 
     def _update_transaction(self, ts, price, current_ts, mid, quantity, reason):
         side = "long" if quantity > 0 else "short"
-        direction = 1 if quantity > 0 else -1
-        pnl_ratio = direction * (mid - price) / price
 
         self.transaction.append(
             {
@@ -60,7 +59,6 @@ class MicroPulseIndicators:
                 "exit_price": mid,
                 "quantity": quantity,
                 "side": side,
-                "pnl_ratio": pnl_ratio,
                 "exit_reason": reason,
             }
         )
@@ -119,7 +117,7 @@ class MicroPulseIndicators:
         for price, size in bids:
             price = float(price)
             size = float(size)
-            if size > avg_bid_size * self.wall_factor:
+            if size > avg_bid_size * self.wall_factor and size > self.min_wall_vol:
                 if price not in self.bid_walls:
                     self.bid_walls[price] = {"size": size, "created_ts": ts}
 
@@ -127,7 +125,7 @@ class MicroPulseIndicators:
         for price, size in asks:
             price = float(price)
             size = float(size)
-            if size > avg_ask_size * self.wall_factor:
+            if size > avg_ask_size * self.wall_factor and size > self.min_wall_vol:
                 if price not in self.ask_walls:
                     self.ask_walls[price] = {"size": size, "created_ts": ts}
 
@@ -214,7 +212,7 @@ class MicroPulseIndicators:
 ind = MicroPulseIndicators()
 STREAM_URL = (
     "wss://fstream.binance.com/stream?"
-    "streams=btcusdt@depth5@100ms/btcusdt@trade"
+    "streams=btcusdt@depth20@100ms/btcusdt@trade"
 )
 
 def check_entry(stats):
@@ -230,12 +228,12 @@ def check_entry(stats):
     tps = stats["trades_per_sec"]
     avg_trade_size = stats["avg_trade_size"]
 
-    MIN_SPIKE = 0.0005
-    MIN_TPS = 2.0
+    MIN_SPIKE = 0.0002
+    MIN_TPS = 1.0
     MIN_AVG_SIZE = 0.05
-    MIN_OBI = 0.15
-    MAX_ENTRY_DELAY = 2.0
-    MAX_WALL_DIST = 0.0007
+    MIN_OBI = 0.10
+    MAX_ENTRY_DELAY = 3.0
+    MAX_WALL_DIST = 0.0012
 
     removed_ts = wall["removed_ts"]
     if time.time() - removed_ts > MAX_ENTRY_DELAY:
