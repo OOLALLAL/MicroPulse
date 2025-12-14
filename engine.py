@@ -26,18 +26,43 @@ class MicroPulseIndicators:
         self.last_wall_event = None
 
         self.trade_quantity: float = 0.01
-        self.position = {}  # {ts: {price: p, quantity: q}}
+
+        self.positions = {}  # {pos_id: {...}}
+        self._pos_seq = 0
 
         self.transaction = []
 
-    def _update_position(self, ts, price, side: float):
-        self.position[ts] = {
-            "price": price,
-            "quantity": self.trade_quantity * side,
-            "entry_cvd": self.cvd,
-            "entry_obi": self.obi,
-            "current_tp": 0.0008,
+        self.book = {
+            "best_bid": None,
+            "best_ask": None,
+            "spread": None
         }
+
+
+        self.last_flush_ts = time.time()
+        self.FLUSH_EVERY_N = 20
+        self.FLUSH_EVERY_SEC = 5 * 60.0
+
+    def maybe_flush(self):
+
+        if not self.transaction:
+            return
+
+        now = time.time()
+
+        if len(self.transaction) >= self.FLUSH_EVERY_N:
+            self._log_transactions()
+            self.last_flush_ts = now
+            return
+
+        if now - self.last_flush_ts >= self.FLUSH_EVERY_SEC:
+            self._log_transactions()
+            self.last_flush_ts = now
+
+
+    def _new_pos_id(self, ts: float) -> str:
+        self._pos_seq += 1
+        return f"{int(ts * 1000)}_{self._pos_seq}"
 
     def _trim_buffers(self, ts):
         cutoff = ts - self.window_sec
@@ -48,18 +73,83 @@ class MicroPulseIndicators:
         while self.trade_buffer and self.trade_buffer[0][0] < cutoff:
             self.trade_buffer.popleft()
 
-    def _update_transaction(self, ts, price, current_ts, mid, quantity, reason):
-        side = "long" if quantity > 0 else "short"
+    def _update_position(self, ts, price, side: float, wall_event: dict, stats: dict):
+        pos_id = self._new_pos_id(ts)
+
+        wall_price = float(wall_event.get("price"))
+        removed_ts = float(wall_event.get("removed_ts"))
+        wall_dist = abs(wall_price - price) / price if price != 0.0 else 0.0
+
+        self.positions[pos_id] = {
+            "entry_ts": ts,
+            "entry_price": price,
+            "quantity": self.trade_quantity * side,
+
+            "entry_cvd": self.cvd,
+            "entry_obi": self.obi,
+            "current_tp": 0.0008,
+
+            "wall_side": wall_event.get("side"),
+            "wall_price": wall_price,
+            "wall_removed_ts": removed_ts,
+            "wall_dist": wall_dist,
+
+            "entry_spike_up": float(stats.get("spike_up", 0.0)),
+            "entry_spike_down": float(stats.get("spike_down", 0.0)),
+            "entry_tps": float(stats.get("trades_per_sec", 0.0)),
+            "entry_avg_trade_size": float(stats.get("avg_trade_size", 0.0)),
+
+            "entry_best_bid": self.book.get("best_bid", None),
+            "entry_best_ask": self.book.get("best_ask", None),
+            "entry_spread": self.book.get("spread", None),
+
+            "exit_best_bid": None,
+            "exit_best_ask": None,
+            "exit_spread": None,
+
+            "max_favorable": 0.0,
+            "max_adverse": 0.0,
+        }
+        return pos_id
+
+    def _update_transaction(self, pos_id: str, exit_ts, exit_price, reason):
+        pos = self.positions.get(pos_id)
+        if pos is None:
+            return
+
+        qty = pos["quantity"]
+        side = "long" if qty > 0 else "short"
 
         self.transaction.append(
             {
-                "entry_ts": ts,
-                "entry_price": price,
-                "exit_ts": current_ts,
-                "exit_price": mid,
-                "quantity": quantity,
+                "pos_id": pos_id,
+                "entry_ts": pos["entry_ts"],
+                "entry_price": pos["entry_price"],
+                "exit_ts": exit_ts,
+                "exit_price": exit_price,
+                "quantity": qty,
                 "side": side,
                 "exit_reason": reason,
+
+                "max_favorable": pos.get("max_favorable"),
+                "max_adverse": pos.get("max_adverse"),
+
+                "exit_best_bid": pos.get("exit_best_bid"),
+                "exit_best_ask": pos.get("exit_best_ask"),
+                "exit_spread": pos.get("exit_spread"),
+
+                "wall_side": pos.get("wall_side"),
+                "wall_price": pos.get("wall_price"),
+                "wall_removed_ts": pos.get("wall_removed_ts"),
+                "wall_dist": pos.get("wall_dist"),
+
+                "entry_obi": pos.get("entry_obi"),
+                "entry_spike_up": pos.get("entry_spike_up"),
+                "entry_spike_down": pos.get("entry_spike_down"),
+                "entry_tps": pos.get("entry_tps"),
+                "entry_avg_trade_size": pos.get("entry_avg_trade_size"),
+
+                "tp_final": pos.get("current_tp"),
             }
         )
 
@@ -142,6 +232,11 @@ class MicroPulseIndicators:
         self._trim_buffers(ts)
         self._update_walls(ts, bids, asks)
 
+        self.book["best_bid"] = best_bid
+        self.book["best_ask"] = best_ask
+        self.book["spread"] = best_ask - best_bid
+
+
     def get_obi(self, bids, asks):
         total_bid = sum(float(b[1]) for b in bids)
         total_ask = sum(float(a[1]) for a in asks)
@@ -205,7 +300,8 @@ class MicroPulseIndicators:
             "trades_per_sec": trades_per_sec,
             "avg_trade_size": avg_trade_size,
             "last_wall_event": self.last_wall_event,
-            "position": self.position,
+
+            "positions": self.positions,
         }
 
 
@@ -228,12 +324,12 @@ def check_entry(stats):
     tps = stats["trades_per_sec"]
     avg_trade_size = stats["avg_trade_size"]
 
-    MIN_SPIKE = 0.0002
-    MIN_TPS = 1.0
-    MIN_AVG_SIZE = 0.05
-    MIN_OBI = 0.10
-    MAX_ENTRY_DELAY = 3.0
-    MAX_WALL_DIST = 0.0012
+    MIN_SPIKE = 0.0003
+    MIN_TPS = 0.6
+    MIN_AVG_SIZE = 0.035
+    MIN_OBI = 0.07
+    MAX_ENTRY_DELAY = 1.75
+    MAX_WALL_DIST = 0.0009
 
     removed_ts = wall["removed_ts"]
     if time.time() - removed_ts > MAX_ENTRY_DELAY:
@@ -256,7 +352,7 @@ def check_entry(stats):
                 f"[SIGNAL SHORT] mid={mid:.2f}, spike_up={spike_up:.4%}, "
                 f"obi={obi:.4f}, wall={wall}, tps={tps:.2f}, ats={avg_trade_size:.4f}"
             )
-            ind._update_position(time.time(), mid, -1)
+            ind._update_position(time.time(), mid, -1, wall_event=wall, stats=stats)
 
     elif side == "bid":
         if spike_down > MIN_SPIKE and obi > MIN_OBI:
@@ -264,46 +360,61 @@ def check_entry(stats):
                 f"[SIGNAL LONG] mid={mid:.2f}, spike_dn={spike_down:.4%}, "
                 f"obi={obi:.3f}, wall={wall}, tps={tps:.2f}, ats={avg_trade_size:.4f}"
             )
-            ind._update_position(time.time(), mid, 1)
+            ind._update_position(time.time(), mid, 1, wall_event=wall, stats=stats)
 
     ind.last_wall_event = None
 
-def check_exit(stats):
+def _stamp_exit_book(trade: dict, book: dict):
+    trade["exit_best_bid"] = book.get("best_bid")
+    trade["exit_best_ask"] = book.get("best_ask")
+    trade["exit_spread"] = book.get("spread")
+
+def check_exit(stats, book):
     mid = stats["mid"]
-    pos = ind.position
+    pos = ind.positions
     if not pos:
         return
 
-    current_ts = time.time()
-    BASE_TP = 0.0008
+    exit_ts = time.time()
+
+    BASE_TP = 0.0015
     SL = 0.0005
     MAX_HOLD = 15.0
+    MIN_HOLD = 2.0
 
-    FAST_WINDOW = 0.5
-    FAST_FAIL = 0.0003
+    FAST_WINDOW = 1.5
+    FAST_FAIL = 0.0004
 
     BOOST_WINDOW = 1.0
     BOOST_RET = 0.0005
-    BOOST_TP = 0.0015
+    BOOST_TP = 0.0025
 
     REV_CVD = 0.05
     REV_OBI = 0.1
 
-    for ts, trade in list(pos.items()):
-        price = trade["price"]
+    for pos_id, trade in list(pos.items()):
+        entry_ts = trade["entry_ts"]
+        price = trade["entry_price"]
         quantity = trade["quantity"]
         entry_cvd = trade.get("entry_cvd")
         entry_obi = trade.get("entry_obi")
         current_tp = trade.get("current_tp", BASE_TP)
 
-        hold_time = current_ts - ts
-        if hold_time > MAX_HOLD:
-            ind._update_transaction(ts, price, current_ts, mid, quantity, "time_stop")
-            pos.pop(ts)
-            continue
-
         direction = quantity / abs(quantity)
         position_return = direction * (mid - price) / price
+
+        trade["max_favorable"] = max(trade["max_favorable"], position_return)
+        trade["max_adverse"] = min(trade["max_adverse"], position_return)
+
+        hold_time = exit_ts - entry_ts
+        if hold_time < MIN_HOLD:
+            continue
+
+        if hold_time > MAX_HOLD:
+            _stamp_exit_book(trade, book)
+            ind._update_transaction(pos_id, exit_ts, mid, "time_stop")
+            pos.pop(pos_id)
+            continue
 
         delta_cvd = None
         delta_obi = None
@@ -336,8 +447,9 @@ def check_exit(stats):
                     reason = "flow_reversal"
 
         if reason is not None:
-            ind._update_transaction(ts, price, current_ts, mid, quantity, reason)
-            pos.pop(ts)
+            _stamp_exit_book(trade, book)
+            ind._update_transaction(pos_id, exit_ts, mid, reason)
+            pos.pop(pos_id)
 
 def on_message(ws, message):
     msg = json.loads(message)
@@ -370,12 +482,20 @@ def on_message(ws, message):
             f"removed_wall={stats['last_wall_event']}"
         )
         check_entry(stats)
-        check_exit(stats)
+        check_exit(stats, ind.book)
+    ind.maybe_flush()
 
 def on_error(ws, error):
     print("Error:", error)
 
 def on_close(ws, close_status_code, close_msg):
+    now = time.time()
+    mid = ind.mid_price
+    for pos_id, trade in list(ind.positions.items()):
+        _stamp_exit_book(trade, ind.book)
+        ind._update_transaction(pos_id, now, mid, "ws_close")
+        ind.positions.pop(pos_id, None)
+
     ind._log_transactions()
     print("WebSocket closed", close_status_code, close_msg)
 
